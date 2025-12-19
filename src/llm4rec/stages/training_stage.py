@@ -142,8 +142,20 @@ def run_training(
     train_mat = load_npz(layout.train_matrix_path)
     collab_data = CollaborativeGPTGeneratorBatch(tokenizer, train_mat)
 
-    review_loader = DataLoader(review_data, batch_size=batch_size, collate_fn=review_data.collate_fn)
-    collab_loader = DataLoader(collab_data, batch_size=batch_size, collate_fn=collab_data.collate_fn)
+    # num_workers=0 required because collate_fn does tokenization which isn't picklable
+    # But we add prefetch_factor for slight improvement
+    review_loader = DataLoader(
+        review_data, 
+        batch_size=batch_size, 
+        collate_fn=review_data.collate_fn,
+        num_workers=0,
+    )
+    collab_loader = DataLoader(
+        collab_data, 
+        batch_size=batch_size, 
+        collate_fn=collab_data.collate_fn,
+        num_workers=0,
+    )
 
     # Models
     content_base = GPT4RecommendationBaseModel(base_config, gpt2model)
@@ -183,56 +195,10 @@ def run_training(
         epoch_loss_sum = 0.0
         total_batches = len(review_loader)
 
-        # Use iterator with heartbeat for first batch (tokenization can be slow)
-        review_iter = iter(review_loader)
         if accelerator.is_local_main_process:
-            print(f"Loading first batch (tokenization may take a while)...", flush=True)
-        
-        try:
-            first_batch = _next_with_heartbeat(
-                review_iter, 
-                label=f"Epoch {epoch+1}", 
-                interval=10.0
-            )
-        except StopIteration:
-            accelerator.print("review_loader is empty!")
-            continue
+            print(f"Starting epoch {epoch+1}, {total_batches} batches total...", flush=True)
 
-        # Process first batch
-        input_ids_prompt, input_ids_main, attention_mask = first_batch
-        review_opt.zero_grad()
-        input_ids_prompt = input_ids_prompt.to(device)
-        input_ids_main = input_ids_main.to(device)
-        attention_mask = attention_mask.to(device)
-
-        outputs = content_model(
-            input_ids_prompt,
-            input_ids_main,
-            labels_main=input_ids_main,
-            attention_mask=attention_mask,
-        )
-        loss = outputs[0]
-        accelerator.backward(loss)
-        review_opt.step()
-
-        v = float(loss.item())
-        epoch_loss_sum += v
-        avg = running.update(v)
-        if accelerator.is_local_main_process:
-            print(f"[Epoch {epoch+1}] batch 1/{total_batches} loss={v:.4f} avg={avg:.4f}", flush=True)
-
-        # Remaining batches with tqdm
-        pbar = tqdm(
-            review_iter,
-            desc=f"Epoch {epoch + 1}/{num_content_pretrain_epochs}",
-            disable=not accelerator.is_local_main_process,
-            leave=True,
-            position=0,
-            miniters=1,
-            initial=1,
-            total=total_batches,
-        )
-        for input_ids_prompt, input_ids_main, attention_mask in pbar:
+        for batch_idx, (input_ids_prompt, input_ids_main, attention_mask) in enumerate(review_loader):
             review_opt.zero_grad()
             input_ids_prompt = input_ids_prompt.to(device)
             input_ids_main = input_ids_main.to(device)
@@ -251,14 +217,14 @@ def run_training(
             v = float(loss.item())
             epoch_loss_sum += v
             avg = running.update(v)
-            pbar.set_postfix({"Loss": f"{v:.4f}", "Avg Loss": f"{avg:.4f}"})
+            
+            # Print progress every 50 batches or on first batch
+            if accelerator.is_local_main_process and (batch_idx == 0 or (batch_idx + 1) % 50 == 0):
+                print(f"  batch {batch_idx+1}/{total_batches} loss={v:.4f} avg={avg:.4f}", flush=True)
 
-        avg_loss = epoch_loss_sum / max(1, len(review_loader))
-        accelerator.print(f"Epoch {epoch + 1} - Review Average Loss: {avg_loss:.4f}")
+        avg_loss = epoch_loss_sum / max(1, total_batches)
         if accelerator.is_local_main_process:
-            print()
-            print(f"Content GPT Pretraining - Epoch {epoch + 1}/{num_content_pretrain_epochs} Summary:")
-            print(f"  Average Review Loss: {avg_loss:.4f}")
+            print(f"Epoch {epoch + 1}/{num_content_pretrain_epochs} complete - Avg Loss: {avg_loss:.4f}", flush=True)
 
         if accelerator.is_main_process and wandb_handle is not None and wandb_handle.enabled:
             log_metrics(wandb_handle, {"content_pretrain/review_avg_loss": avg_loss, "epoch": epoch + 1})
@@ -278,16 +244,12 @@ def run_training(
         collab_running = RunningAverage()
         collab_sum = 0.0
         reg_sum = 0.0
+        collab_total = len(collab_loader)
 
-        pbar = tqdm(
-            collab_loader,
-            desc=f"Epoch {epoch + 1}/{num_iter_epochs}",
-            disable=not accelerator.is_local_main_process,
-            leave=True,
-            position=0,
-            miniters=1,
-        )
-        for input_ids_prompt, input_ids_main, attention_mask in pbar:
+        if accelerator.is_local_main_process:
+            print(f"  Collaborative training: {collab_total} batches...", flush=True)
+
+        for batch_idx, (input_ids_prompt, input_ids_main, attention_mask) in enumerate(collab_loader):
             collab_opt.zero_grad()
             input_ids_prompt = input_ids_prompt.to(device)
             input_ids_main = input_ids_main.to(device)
@@ -321,11 +283,14 @@ def run_training(
             collab_sum += v
             reg_sum += float(reg_loss.item())
             avg = collab_running.update(v)
-            pbar.set_postfix({"Loss": f"{v:.4f}", "Avg Loss": f"{avg:.4f}"})
+            
+            if accelerator.is_local_main_process and (batch_idx == 0 or (batch_idx + 1) % 50 == 0):
+                print(f"    collab batch {batch_idx+1}/{collab_total} loss={v:.4f} avg={avg:.4f}", flush=True)
 
-        collab_avg = collab_sum / max(1, len(collab_loader))
-        reg_avg = reg_sum / max(1, len(collab_loader))
-        accelerator.print(f"Epoch {epoch + 1} - Average Collaborative Loss: {collab_avg:.4f}")
+        collab_avg = collab_sum / max(1, collab_total)
+        reg_avg = reg_sum / max(1, collab_total)
+        if accelerator.is_local_main_process:
+            print(f"  Collaborative done - Avg Loss: {collab_avg:.4f}, Reg Loss: {reg_avg:.4f}", flush=True)
         accelerator.print(f"Epoch {epoch + 1} - Average Regularize Loss: {reg_avg:.4f}")
 
         if accelerator.is_main_process and wandb_handle is not None and wandb_handle.enabled:
@@ -348,16 +313,12 @@ def run_training(
         review_running = RunningAverage()
         review_sum = 0.0
         reg_sum = 0.0
+        review_total = len(review_loader)
 
-        pbar = tqdm(
-            review_loader,
-            desc=f"Epoch {epoch + 1}/{num_iter_epochs}",
-            disable=not accelerator.is_local_main_process,
-            leave=True,
-            position=0,
-            miniters=1,
-        )
-        for input_ids_prompt, input_ids_main, attention_mask in pbar:
+        if accelerator.is_local_main_process:
+            print(f"  Content training: {review_total} batches...", flush=True)
+
+        for batch_idx, (input_ids_prompt, input_ids_main, attention_mask) in enumerate(review_loader):
             review_opt.zero_grad()
             input_ids_prompt = input_ids_prompt.to(device)
             input_ids_main = input_ids_main.to(device)
@@ -386,11 +347,14 @@ def run_training(
             review_sum += v
             reg_sum += float(reg_loss.item())
             avg = review_running.update(v)
-            pbar.set_postfix({"Loss": f"{v:.4f}", "Avg Loss": f"{avg:.4f}"})
+            
+            if accelerator.is_local_main_process and (batch_idx == 0 or (batch_idx + 1) % 50 == 0):
+                print(f"    content batch {batch_idx+1}/{review_total} loss={v:.4f} avg={avg:.4f}", flush=True)
 
-        review_avg = review_sum / max(1, len(review_loader))
-        reg_avg2 = reg_sum / max(1, len(review_loader))
-        accelerator.print(f"Epoch {epoch + 1} - Review Average Loss: {review_avg:.4f}")
+        review_avg = review_sum / max(1, review_total)
+        reg_avg2 = reg_sum / max(1, review_total)
+        if accelerator.is_local_main_process:
+            print(f"  Content done - Avg Loss: {review_avg:.4f}, Reg Loss: {reg_avg2:.4f}", flush=True)
         accelerator.print(f"Epoch {epoch + 1} - Average Regularize Loss: {reg_avg2:.4f}")
 
         if accelerator.is_main_process and wandb_handle is not None and wandb_handle.enabled:
