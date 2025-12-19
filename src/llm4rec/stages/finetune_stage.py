@@ -165,6 +165,8 @@ def run_finetuning(
 
     best_sum = -float("inf")
     best_val_loss = float("inf")
+    global_step = 0
+    LOG_EVERY_N_BATCHES = 10
 
     accelerator.print("-----Begin Finetuning Loop-----")
     for epoch in range(num_epochs):
@@ -175,16 +177,12 @@ def run_finetuning(
         train_running = RunningAverage()
         train_loss_sum = 0.0
         reg_sum = 0.0
+        total_batches = len(train_loader)
 
-        pbar = tqdm(
-            train_loader,
-            desc=f"Epoch {epoch + 1}/{num_epochs}",
-            disable=not accelerator.is_local_main_process,
-            leave=True,
-            position=0,
-            miniters=1,
-        )
-        for input_ids, target_mat, attention_mask, input_ids_main in pbar:
+        if accelerator.is_local_main_process:
+            print(f"  Training: {total_batches} batches...", flush=True)
+
+        for batch_idx, (input_ids, target_mat, attention_mask, input_ids_main) in enumerate(train_loader):
             opt.zero_grad()
             input_ids = input_ids.to(device)
             target_mat = target_mat.to(device)
@@ -216,10 +214,25 @@ def run_finetuning(
             opt.step()
 
             v = float(loss.item())
+            r = float(reg_loss.item())
             train_loss_sum += v
-            reg_sum += float(reg_loss.item())
+            reg_sum += r
             avg = train_running.update(v)
-            pbar.set_postfix({"Loss": f"{v:.4f}", "Avg Loss": f"{avg:.4f}"})
+            global_step += 1
+            
+            # Log to W&B every N batches
+            if accelerator.is_main_process and wandb_handle is not None and wandb_handle.enabled:
+                if global_step % LOG_EVERY_N_BATCHES == 0 or batch_idx == 0:
+                    log_metrics(wandb_handle, {
+                        "rec/batch_loss": v,
+                        "rec/batch_reg_loss": r,
+                        "rec/running_avg": avg,
+                        "batch": batch_idx + 1,
+                        "epoch": epoch + 1,
+                    }, step=global_step)
+            
+            if accelerator.is_local_main_process and (batch_idx == 0 or (batch_idx + 1) % 50 == 0):
+                print(f"    batch {batch_idx+1}/{total_batches} loss={v:.4f} avg={avg:.4f}", flush=True)
 
         train_loss_avg = train_loss_sum / max(1, len(train_loader))
         reg_loss_avg = reg_sum / max(1, len(train_loader))
@@ -299,16 +312,12 @@ def run_finetuning(
         review_running = RunningAverage()
         review_sum = 0.0
         reg_sum2 = 0.0
+        review_total = len(review_loader)
 
-        pbar = tqdm(
-            review_loader,
-            desc=f"Content Epoch {epoch + 1}/{num_epochs}",
-            disable=not accelerator.is_local_main_process,
-            leave=True,
-            position=0,
-            miniters=1,
-        )
-        for input_ids_prompt, input_ids_main, attention_mask in pbar:
+        if accelerator.is_local_main_process:
+            print(f"  Content update: {review_total} batches...", flush=True)
+
+        for batch_idx, (input_ids_prompt, input_ids_main, attention_mask) in enumerate(review_loader):
             review_opt.zero_grad()
             input_ids_prompt = input_ids_prompt.to(device)
             input_ids_main = input_ids_main.to(device)
@@ -333,14 +342,30 @@ def run_finetuning(
             review_opt.step()
 
             v = float(loss.item())
+            r = float(reg_loss.item())
             review_sum += v
-            reg_sum2 += float(reg_loss.item())
+            reg_sum2 += r
             avg = review_running.update(v)
-            pbar.set_postfix({"Loss": f"{v:.4f}", "Avg Loss": f"{avg:.4f}"})
+            global_step += 1
+            
+            # Log to W&B every N batches
+            if accelerator.is_main_process and wandb_handle is not None and wandb_handle.enabled:
+                if global_step % LOG_EVERY_N_BATCHES == 0 or batch_idx == 0:
+                    log_metrics(wandb_handle, {
+                        "finetune_content/batch_loss": v,
+                        "finetune_content/batch_reg_loss": r,
+                        "finetune_content/running_avg": avg,
+                        "batch": batch_idx + 1,
+                        "epoch": epoch + 1,
+                    }, step=global_step)
+            
+            if accelerator.is_local_main_process and (batch_idx == 0 or (batch_idx + 1) % 50 == 0):
+                print(f"    content batch {batch_idx+1}/{review_total} loss={v:.4f} avg={avg:.4f}", flush=True)
 
-        content_loss_avg = review_sum / max(1, len(review_loader))
-        content_reg_avg = reg_sum2 / max(1, len(review_loader))
-        accelerator.print(f"Epoch {epoch + 1} - Content Avg Loss: {content_loss_avg:.4f}")
+        content_loss_avg = review_sum / max(1, review_total)
+        content_reg_avg = reg_sum2 / max(1, review_total)
+        if accelerator.is_local_main_process:
+            print(f"  Content done - Avg Loss: {content_loss_avg:.4f}", flush=True)
 
         if accelerator.is_main_process and wandb_handle is not None and wandb_handle.enabled:
             log_metrics(

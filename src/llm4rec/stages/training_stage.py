@@ -183,6 +183,10 @@ def run_training(
     ensure_dir(out_collab)
 
     metrics: dict[str, Any] = {"num_users": num_users, "num_items": num_items}
+    
+    # Global step counter for W&B batch-level logging
+    global_step = 0
+    LOG_EVERY_N_BATCHES = 10  # Log to W&B every N batches
 
     # Content pretraining loop
     best_review_loss = float("inf")
@@ -217,6 +221,17 @@ def run_training(
             v = float(loss.item())
             epoch_loss_sum += v
             avg = running.update(v)
+            global_step += 1
+            
+            # Log to W&B every N batches
+            if accelerator.is_main_process and wandb_handle is not None and wandb_handle.enabled:
+                if global_step % LOG_EVERY_N_BATCHES == 0 or batch_idx == 0:
+                    log_metrics(wandb_handle, {
+                        "content_pretrain/batch_loss": v,
+                        "content_pretrain/running_avg": avg,
+                        "batch": batch_idx + 1,
+                        "epoch": epoch + 1,
+                    }, step=global_step)
             
             # Print progress every 50 batches or on first batch
             if accelerator.is_local_main_process and (batch_idx == 0 or (batch_idx + 1) % 50 == 0):
@@ -227,7 +242,7 @@ def run_training(
             print(f"Epoch {epoch + 1}/{num_content_pretrain_epochs} complete - Avg Loss: {avg_loss:.4f}", flush=True)
 
         if accelerator.is_main_process and wandb_handle is not None and wandb_handle.enabled:
-            log_metrics(wandb_handle, {"content_pretrain/review_avg_loss": avg_loss, "epoch": epoch + 1})
+            log_metrics(wandb_handle, {"content_pretrain/epoch_avg_loss": avg_loss, "epoch": epoch + 1}, step=global_step)
             log_gpu_memory(wandb_handle, prefix="gpu")
 
         if avg_loss < best_review_loss and accelerator.is_main_process:
@@ -280,9 +295,22 @@ def run_training(
             collab_opt.step()
 
             v = float(loss.item())
+            r = float(reg_loss.item())
             collab_sum += v
-            reg_sum += float(reg_loss.item())
+            reg_sum += r
             avg = collab_running.update(v)
+            global_step += 1
+            
+            # Log to W&B every N batches
+            if accelerator.is_main_process and wandb_handle is not None and wandb_handle.enabled:
+                if global_step % LOG_EVERY_N_BATCHES == 0 or batch_idx == 0:
+                    log_metrics(wandb_handle, {
+                        "collab/batch_loss": v,
+                        "collab/batch_reg_loss": r,
+                        "collab/running_avg": avg,
+                        "batch": batch_idx + 1,
+                        "epoch": epoch + 1,
+                    }, step=global_step)
             
             if accelerator.is_local_main_process and (batch_idx == 0 or (batch_idx + 1) % 50 == 0):
                 print(f"    collab batch {batch_idx+1}/{collab_total} loss={v:.4f} avg={avg:.4f}", flush=True)
@@ -291,16 +319,16 @@ def run_training(
         reg_avg = reg_sum / max(1, collab_total)
         if accelerator.is_local_main_process:
             print(f"  Collaborative done - Avg Loss: {collab_avg:.4f}, Reg Loss: {reg_avg:.4f}", flush=True)
-        accelerator.print(f"Epoch {epoch + 1} - Average Regularize Loss: {reg_avg:.4f}")
 
         if accelerator.is_main_process and wandb_handle is not None and wandb_handle.enabled:
             log_metrics(
                 wandb_handle,
                 {
-                    "collab/lm_avg_loss": collab_avg,
-                    "collab/regularize_avg_loss": reg_avg,
+                    "collab/epoch_avg_loss": collab_avg,
+                    "collab/epoch_reg_loss": reg_avg,
                     "epoch": epoch + 1,
                 },
+                step=global_step,
             )
 
         if collab_avg < best_collab_loss and accelerator.is_main_process:
@@ -344,9 +372,22 @@ def run_training(
             review_opt.step()
 
             v = float(loss.item())
+            r = float(reg_loss.item())
             review_sum += v
-            reg_sum += float(reg_loss.item())
+            reg_sum += r
             avg = review_running.update(v)
+            global_step += 1
+            
+            # Log to W&B every N batches
+            if accelerator.is_main_process and wandb_handle is not None and wandb_handle.enabled:
+                if global_step % LOG_EVERY_N_BATCHES == 0 or batch_idx == 0:
+                    log_metrics(wandb_handle, {
+                        "content/batch_loss": v,
+                        "content/batch_reg_loss": r,
+                        "content/running_avg": avg,
+                        "batch": batch_idx + 1,
+                        "epoch": epoch + 1,
+                    }, step=global_step)
             
             if accelerator.is_local_main_process and (batch_idx == 0 or (batch_idx + 1) % 50 == 0):
                 print(f"    content batch {batch_idx+1}/{review_total} loss={v:.4f} avg={avg:.4f}", flush=True)
@@ -355,16 +396,16 @@ def run_training(
         reg_avg2 = reg_sum / max(1, review_total)
         if accelerator.is_local_main_process:
             print(f"  Content done - Avg Loss: {review_avg:.4f}, Reg Loss: {reg_avg2:.4f}", flush=True)
-        accelerator.print(f"Epoch {epoch + 1} - Average Regularize Loss: {reg_avg2:.4f}")
 
         if accelerator.is_main_process and wandb_handle is not None and wandb_handle.enabled:
             log_metrics(
                 wandb_handle,
                 {
-                    "content/lm_avg_loss": review_avg,
-                    "content/regularize_avg_loss": reg_avg2,
+                    "content/epoch_avg_loss": review_avg,
+                    "content/epoch_reg_loss": reg_avg2,
                     "epoch": epoch + 1,
                 },
+                step=global_step,
             )
             log_gpu_memory(wandb_handle, prefix="gpu")
 
