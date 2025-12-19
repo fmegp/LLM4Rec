@@ -1,0 +1,26 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+.pytest_cache/
+
+# Virtualenvs
+.venv/
+venv/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Local artifacts / datasets
+tmp/
+data/
+datasets/
+outputs/
+run_*/
+wandb/
+
+# OS
+.DS_Store
+.env
+

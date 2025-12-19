@@ -1,0 +1,17 @@
+# Colab runtime already provides Python/Torch/Numpy; keep this minimal.
+# Install with: pip -q install -r requirements-colab.txt
+#
+# Note: versions are intentionally not tightly pinned to avoid fighting Colab images.
+# The notebook will print your runtime versions and can warn if incompatible.
+
+accelerate>=0.34.0
+fsspec>=2024.3.0
+gdown>=5.2.0
+huggingface_hub>=0.24.0
+python-dotenv>=1.0.0
+safetensors>=0.4.5
+tqdm>=4.66.0
+transformers>=4.45.0
+wandb>=0.17.0
+
+

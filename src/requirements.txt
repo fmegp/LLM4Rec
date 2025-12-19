@@ -1,0 +1,11 @@
+# Deprecated: prefer `requirements-colab.txt` (Colab) or `requirements-local.txt` (local).
+accelerate>=0.34.0
+fsspec>=2024.3.0
+gdown>=5.2.0
+huggingface_hub>=0.24.0
+numpy>=1.23
+scipy>=1.8
+torch>=2.0
+tqdm>=4.66.0
+transformers>=4.45.0
+wandb>=0.17.0
