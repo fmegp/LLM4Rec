@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import concurrent.futures
 import os
 import pickle
+import time
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +14,19 @@ from scipy.sparse import load_npz
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 from transformers import GPT2Model
+
+
+def _next_with_heartbeat(iterator, *, label: str, interval: float = 10.0):
+    """Fetch next item from iterator with heartbeat messages while waiting."""
+    t0 = time.time()
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
+        fut = ex.submit(next, iterator)
+        while True:
+            try:
+                return fut.result(timeout=interval)
+            except concurrent.futures.TimeoutError:
+                elapsed = int(time.time() - t0)
+                print(f"[{label}] preparing batch... {elapsed}s elapsed", flush=True)
 
 from ..data import CollaborativeGPTGeneratorBatch, UserItemContentGPTDatasetBatch
 from ..hf import load_gpt2_base_model, load_tokenizer_with_user_item_tokens
@@ -166,14 +181,56 @@ def run_training(
 
         running = RunningAverage()
         epoch_loss_sum = 0.0
+        total_batches = len(review_loader)
 
+        # Use iterator with heartbeat for first batch (tokenization can be slow)
+        review_iter = iter(review_loader)
+        if accelerator.is_local_main_process:
+            print(f"Loading first batch (tokenization may take a while)...", flush=True)
+        
+        try:
+            first_batch = _next_with_heartbeat(
+                review_iter, 
+                label=f"Epoch {epoch+1}", 
+                interval=10.0
+            )
+        except StopIteration:
+            accelerator.print("review_loader is empty!")
+            continue
+
+        # Process first batch
+        input_ids_prompt, input_ids_main, attention_mask = first_batch
+        review_opt.zero_grad()
+        input_ids_prompt = input_ids_prompt.to(device)
+        input_ids_main = input_ids_main.to(device)
+        attention_mask = attention_mask.to(device)
+
+        outputs = content_model(
+            input_ids_prompt,
+            input_ids_main,
+            labels_main=input_ids_main,
+            attention_mask=attention_mask,
+        )
+        loss = outputs[0]
+        accelerator.backward(loss)
+        review_opt.step()
+
+        v = float(loss.item())
+        epoch_loss_sum += v
+        avg = running.update(v)
+        if accelerator.is_local_main_process:
+            print(f"[Epoch {epoch+1}] batch 1/{total_batches} loss={v:.4f} avg={avg:.4f}", flush=True)
+
+        # Remaining batches with tqdm
         pbar = tqdm(
-            review_loader,
+            review_iter,
             desc=f"Epoch {epoch + 1}/{num_content_pretrain_epochs}",
             disable=not accelerator.is_local_main_process,
             leave=True,
             position=0,
             miniters=1,
+            initial=1,
+            total=total_batches,
         )
         for input_ids_prompt, input_ids_main, attention_mask in pbar:
             review_opt.zero_grad()
